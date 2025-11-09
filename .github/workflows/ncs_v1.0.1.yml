@@ -1,0 +1,92 @@
+name: Build NCP firmware NCS v1.0.1
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+  workflow_dispatch:
+
+env:
+  NCS_ZIGBEE_VER: v1.0.1
+  NCS_ZIGBEE_VER_HEX: "0x01000100"
+  BOARD: nrf52840dk
+  BOARD_TARGET: nrf52840dk/nrf52840
+  BOARD_TARGET_NAME: nrf52840dk_nrf52840
+  BAUDRATE: 115200
+  MCUBOOT_BAUDRATE: 115200
+
+jobs:
+  build-r22:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Clone the repo to a subdirectory, so we can initialize the Zephyr
+          # workspace in the parent directory.
+          path: zephyr-workspace/extra
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+           python-version: 3.13
+
+      - name: 🧰 Install Dependencies + West
+        # Install the Zephyr host build dependencies, and the `west` Python tool.
+        # This list is from Zephyr's getting started guide:
+        # https://docs.zephyrproject.org/latest/develop/getting_started/index.html
+        run: |
+          sudo apt update
+          sudo apt install --no-install-recommends git cmake ninja-build gperf \
+            ccache dfu-util device-tree-compiler wget \
+            python3-dev python3-pip python3-setuptools python3-tk python3-wheel xz-utils file \
+            make gcc gcc-multilib g++-multilib libsdl2-dev libmagic1
+
+          pip3 install west
+
+      - name: 🪁 Install Zephyr SDK
+        # Fetch the Zephyr SDK from the GitHub Release artifact, unpack it and
+        # run the setup script, selecting the '-c' option to install cmake
+        # packages and the '-t arm-zephyr-eabi' option to install the toolchain
+        # only for the arm-zephyr-eabi (Cortex-M) architecture, since we don't
+        # need the other toolchains (xtensa, riscv, etc.)
+        run: |
+          wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.17.4/zephyr-sdk-0.17.4_linux-x86_64_minimal.tar.xz
+          tar xf zephyr-sdk-0.17.4_linux-x86_64_minimal.tar.xz -C ~/
+          ~/zephyr-sdk-0.17.4/setup.sh -c -t arm-zephyr-eabi
+
+      - name: 🪁 Install nRF SDK
+        run: |
+          mkdir -p zephyr-workspace
+          git clone https://github.com/nrfconnect/ncs-zigbee-r22.git zephyr-workspace/ncs-zigbee -b $NCS_ZIGBEE_VER --depth 1
+
+      - name: 🪁 Apply overlay
+        run: |
+          cp zephyr-workspace/extra/$BOARD_TARGET_NAME.overlay zephyr-workspace/ncs-zigbee/samples/ncp/boards/$BOARD_TARGET_NAME.overlay
+          cp zephyr-workspace/extra/$BOARD_TARGET_NAME.conf zephyr-workspace/ncs-zigbee/samples/ncp/boards/$BOARD_TARGET_NAME.conf
+          sed -i "s/current-speed = \<[0-9]+\>;/current-speed = <$BAUDRATE>;/" zephyr-workspace/ncs-zigbee/samples/ncp/boards/$BOARD_TARGET_NAME.overlay
+          sed -i "s/current-speed = \<[0-9]+\>;/current-speed = <$MCUBOOT_BAUDRATE>;/" zephyr-workspace/extra/mcuboot.overlay
+          echo -e "\n\nzb_uint32_t zb_osif_get_fw_version(void) { return ${NCS_ZIGBEE_VER_HEX}; }" >> zephyr-workspace/ncs-zigbee/samples/ncp/src/main.c
+
+      - name: ♻️ Initialize Zephyr Workspace
+        # Set up the Zephyr workspace and install the Python dependencies
+        run: |
+          cd zephyr-workspace
+          west init -l ncs-zigbee
+          west update --narrow -o=--depth=1
+          pip3 install -r zephyr/scripts/requirements.txt
+
+      - name: 🔨 Build Project
+        run: |
+          cd zephyr-workspace
+          west build -b $BOARD_TARGET --sysbuild ncs-zigbee/samples/ncp -DSB_CONFIG_BOOTLOADER_MCUBOOT=y -Dmcuboot_EXTRA_CONF_FILE=$(pwd)/extra/mcuboot.conf -Dmcuboot_DTC_OVERLAY_FILE=$(pwd)/extra/mcuboot.overlay
+          mv build/merged.hex build/ncp-r22-$BOARD-$NCS_ZIGBEE_VER-$BAUDRATE-mcuboot-$MCUBOOT_BAUDRATE.hex
+          unzip build/dfu_application.zip ncp.signed.bin -d build/
+          mv build/ncp.signed.bin build/ncp-r22-$BOARD-$NCS_ZIGBEE_VER-$BAUDRATE.bin
+
+      - name: 📦 Save Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            zephyr-workspace/build/*.hex
+            zephyr-workspace/build/*.bin
